@@ -21,11 +21,10 @@ DB_PATH = "/Users/yuma/Output/Trade/edinet.db"
 INCLUDE_ALL_DOCS = False
 INCLUDE_ALL_METRICS = False
 MAX_WORKERS = 6
-MARKET_FILTER = None  # None / "prime" / "growth" / "standard" / "nikkei225"
-MARKET_MAPPING_CSV = "/Users/yuma/Projects/Trade/data/tse_listed.csv"
-NIKKEI225_CSV = "/Users/yuma/Projects/Trade/data/nikkei225.csv"
-NIKKEI225_TABLE = "Teble_nikkei225"
 EDINET_CODE_CSV = "/Users/yuma/Projects/Trade/data/edinet_code.csv"
+EDINET_CODE_URL = "https://disclosure2dl.edinet-fsa.go.jp/searchdocument/codelist/Edinetcode.zip"
+NIKKEI225_SOURCE_URL = "https://indexes.nikkei.co.jp/en/nkave/index/component"
+MASTER_COMPANY_TABLE = "master_company"
 ```
 
 3) 実行
@@ -34,18 +33,10 @@ EDINET_CODE_CSV = "/Users/yuma/Projects/Trade/data/edinet_code.csv"
 /Users/yuma/.pyenv/versions/3.12.0/bin/python /Users/yuma/Projects/Trade/scripts/edinet_fetch_financials.py
 ```
 
-## 日経平均採用銘柄テーブル
+## 日経平均採用銘柄の扱い
 
-日経平均採用銘柄（225銘柄）のテーブルを作成するスクリプトを追加しています。
-実行すると `Teble_nikkei225` テーブルが作成され、DBとCSVに保存されます。
-
-```
-/Users/yuma/.pyenv/versions/3.12.0/bin/python /Users/yuma/Projects/Trade/scripts/build_nikkei225_table.py
-```
-
-設定は `scripts/build_nikkei225_table.py` の先頭で変更できます。
-`SOURCE_MODE="web"` で取得できない場合は `SOURCE_MODE="csv"` にして
-`INPUT_CSV` にCSVを指定してください（先頭列=4桁コード、2列目=会社名）。
+`master_company.group_name` に `Nikkei225` を付与するため、日経平均採用銘柄の一覧を参照します。
+取得に失敗する場合は未設定のままになります。
 
 ## 仕様
 
@@ -53,10 +44,10 @@ EDINET_CODE_CSV = "/Users/yuma/Projects/Trade/data/edinet_code.csv"
 - EDINET提出書類一覧API（type=2）から対象書類を取得
 - `INCLUDE_ALL_DOCS=False` の場合は以下のキーワードで絞り込み
   - 有価証券報告書 / 四半期報告書 / 半期報告書
-- `MARKET_FILTER` を指定すると市場/指数で絞り込み
-  - `"prime"` / `"growth"` / `"standard"` は `MARKET_MAPPING_CSV` を参照
-  - `"nikkei225"` は `NIKKEI225_TABLE` テーブル優先、無ければ `NIKKEI225_CSV` を参照
-  - `secCode` が空の場合は `EDINET_CODE_CSV` の `EdinetCode` → `SecuritiesCode` で補完
+- `master_company` テーブルを自動更新
+  - EDINETコード（企業コード）を主キーとして登録
+  - 株価コードが空の場合は `EDINET_CODE_CSV`（無ければ `EDINET_CODE_URL` から自動取得）で補完
+  - 日経平均採用銘柄は `group_name` に `Nikkei225` を登録
 - 対象書類がXBRL対応（`xbrlFlag=1`）の場合のみXBRL ZIPを取得
 - XBRLから数値項目を抽出し、SQLiteに保存
 - 進捗は標準出力に表示
@@ -97,7 +88,11 @@ EDINET_CODE_CSV = "/Users/yuma/Projects/Trade/data/edinet_code.csv"
 - XBRLのタグは一般的な名称でマッチングしています。会社や報告書により取得できない場合があります。
 - `INCLUDE_ALL_METRICS=True` にするとXBRLの数値ファクトをJSON保存します（DBサイズが増えます）。
 - `.env` とDBは `.gitignore` で除外済み。
-- 市場/指数の絞り込みには、銘柄コードの対応表ファイルが必要です。
-  - `MARKET_MAPPING_CSV` の形式: `sec_code,market`（例: `7203,prime`）
-  - `NIKKEI225_CSV` の形式: 先頭列に4桁コード（例: `9984`）
-  - `Teble_nikkei225` を作るには `scripts/build_nikkei225_table.py` を実行してください。
+- `master_company` は `edinet_code` / `securities_code` / `company_name` / `market` / `group_name` / `updated_at` を保持します。
+
+
+##　未対応20260203
+- masterCompanyに証券コードが登録されてない
+- HistoryRunテーブルを作成する。
+- SecCodeがNullの情報は正直不要。どうするか
+

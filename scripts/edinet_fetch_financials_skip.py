@@ -976,8 +976,7 @@ def save_documents(conn: sqlite3.Connection, date_str: str, documents: list[dict
             f"""
             INSERT INTO edinet_documents ({", ".join(columns)})
             VALUES ({placeholders})
-            ON CONFLICT(doc_id) DO UPDATE SET
-                {update_assignments}
+            ON CONFLICT(doc_id) DO NOTHING
             """,
             rows,
         )
