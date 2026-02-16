@@ -20,7 +20,7 @@ DEFAULT_KEYWORDS = ["有価証券報告書"]
 
 # === Configuration (edit here; no CLI args) ===
 START_DATE = "2025-01-01"
-END_DATE = "2025-01-31"
+END_DATE = "2025-02-28"
 DB_PATH = "/Users/yuma/Output/Trade/edinet.db"
 INCLUDE_ALL_DOCS = False  # True: no filtering by keywords
 INCLUDE_ALL_METRICS = False  # True: store all numeric facts in JSON
@@ -130,6 +130,14 @@ def jst_today_str() -> str:
     return jst.date().isoformat()
 
 
+def jst_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc).astimezone(dt.timezone(dt.timedelta(hours=9)))
+
+
+def format_jst(dt_value: dt.datetime) -> str:
+    return dt_value.strftime("%Y/%m/%d-%H:%M:%S")
+
+
 def daterange(start_date: dt.date, end_date: dt.date):
     current = start_date
     while current <= end_date:
@@ -199,12 +207,27 @@ def normalize_sec_code(value: str | None) -> str | None:
     text = str(value).strip()
     if not text:
         return None
-    # EDINET secCode can be 5 digits with trailing 0; normalize to 4-digit code.
+    # EDINET secCode can be 5 chars with trailing 0 (e.g., 215A0); normalize by trimming.
+    if len(text) == 5 and text.endswith("0"):
+        text = text[:-1]
     if text.isdigit():
-        if len(text) == 5 and text.endswith("0"):
-            text = text[:-1]
         return text.zfill(4)
     return text
+
+
+def quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def round_numeric(value: float | int | None) -> float | int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return round(float(value), 4)
+    except (TypeError, ValueError):
+        return None
 
 
 def read_csv_rows(path: str) -> tuple[list[str], list[list[str]]]:
@@ -588,7 +611,7 @@ def ensure_master_company_entries(db_path: str, csv_path: str, edinet_codes: set
 
         if missing:
             mapping = load_edinet_csv_mapping(csv_path, missing)
-            now = dt.datetime.now(dt.timezone.utc).isoformat()
+            now = format_jst(jst_now())
             payload = []
             for code in missing:
                 info = mapping.get(code, {})
@@ -631,7 +654,7 @@ def ensure_master_company_entries(db_path: str, csv_path: str, edinet_codes: set
         if need_jpx:
             jpx_map = load_jpx_listing_mapping()
             if jpx_map:
-                now = dt.datetime.now(dt.timezone.utc).isoformat()
+                now = format_jst(jst_now())
                 for sec_code, info in jpx_map.items():
                     conn.execute(
                         f"""
@@ -657,7 +680,7 @@ def ensure_master_company_entries(db_path: str, csv_path: str, edinet_codes: set
             if nikkei_codes:
                 codes_list = list(nikkei_codes)
                 chunk = 900
-                now = dt.datetime.now(dt.timezone.utc).isoformat()
+                now = format_jst(jst_now())
                 for i in range(0, len(codes_list), chunk):
                     subset = codes_list[i : i + chunk]
                     placeholders = ", ".join(["?"] * len(subset))
@@ -673,6 +696,54 @@ def ensure_master_company_entries(db_path: str, csv_path: str, edinet_codes: set
                 conn.commit()
     finally:
         conn.close()
+
+
+def update_master_company_sec_codes(db_path: str, documents: list[dict]) -> int:
+    mapping: dict[str, str] = {}
+    for doc in documents:
+        edinet_code = str(doc.get("edinetCode") or doc.get("edinet_code") or "").strip()
+        sec_code = normalize_sec_code(doc.get("secCode") or doc.get("sec_code"))
+        if edinet_code and sec_code:
+            mapping[edinet_code] = sec_code
+    if not mapping:
+        return 0
+    conn = sqlite3.connect(db_path)
+    try:
+        ensure_master_company_schema(conn)
+        updated = 0
+        now = format_jst(jst_now())
+        for edinet_code, sec_code in mapping.items():
+            res = conn.execute(
+                f"""
+                UPDATE {MASTER_COMPANY_TABLE}
+                SET securities_code=COALESCE(securities_code, ?),
+                    updated_at=?
+                WHERE edinet_code=?
+                """,
+                (sec_code, now, edinet_code),
+            )
+            updated += res.rowcount
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
+def ensure_history_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS table_HistoryRun (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            start_at TEXT NOT NULL,
+            end_at TEXT NOT NULL,
+            duration_sec REAL NOT NULL,
+            total_docs INTEGER NOT NULL,
+            inserted_docs INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            error_message TEXT
+        )
+        """
+    )
 
 
 def download_edinet_code_csv(path: str) -> str | None:
@@ -841,148 +912,165 @@ def extract_metrics_from_xbrl(xbrl_bytes: bytes, include_all: bool) -> tuple[dic
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS edinet_documents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fetched_date TEXT NOT NULL,
-            doc_id TEXT,
-            edinet_code TEXT,
-            sec_code TEXT,
-            filer_name TEXT,
-            doc_description TEXT,
-            submit_datetime TEXT,
-            period_end TEXT,
-            sales_amount REAL,
-            employee_count INTEGER,
-            operating_income REAL,
-            ordinary_income REAL,
-            net_income REAL,
-            total_assets REAL,
-            total_liabilities REAL,
-            total_equity REAL,
-            cash_and_equivalents REAL,
-            operating_cf REAL,
-            investing_cf REAL,
-            financing_cf REAL,
-            eps REAL,
-            bps REAL,
-            roe REAL,
-            roa REAL,
-            gross_margin REAL,
-            operating_margin REAL,
-            net_margin REAL,
-            equity_ratio REAL,
-            cash_ratio REAL,
-            all_numeric_facts_json TEXT,
-            raw_json TEXT NOT NULL,
-            fetched_at TEXT NOT NULL
+    table_all = "table_docment_all"
+    table_select = "table_docment_serect"
+
+    def create_table(table: str) -> None:
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {quote_identifier(table)} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                {quote_identifier("取得日")} TEXT NOT NULL,
+                {quote_identifier("doc_id")} TEXT,
+                {quote_identifier("Edinet_code")} TEXT,
+                {quote_identifier("Sec_code")} TEXT,
+                {quote_identifier("提出者名")} TEXT,
+                {quote_identifier("書類説明")} TEXT,
+                {quote_identifier("提出日時")} TEXT,
+                {quote_identifier("期間末日")} TEXT,
+                {quote_identifier("売上高")} REAL,
+                {quote_identifier("従業員数")} INTEGER,
+                {quote_identifier("営業利益")} REAL,
+                {quote_identifier("経常利益")} REAL,
+                {quote_identifier("純利益")} REAL,
+                {quote_identifier("総資産")} REAL,
+                {quote_identifier("負債総額")} REAL,
+                {quote_identifier("純資産")} REAL,
+                {quote_identifier("現金及び現金同等物")} REAL,
+                {quote_identifier("営業CF")} REAL,
+                {quote_identifier("投資CF")} REAL,
+                {quote_identifier("財務CF")} REAL,
+                {quote_identifier("EPS")} REAL,
+                {quote_identifier("BPS")} REAL,
+                {quote_identifier("ROE")} REAL,
+                {quote_identifier("ROA")} REAL,
+                {quote_identifier("売上総利益率")} REAL,
+                {quote_identifier("営業利益率")} REAL,
+                {quote_identifier("純利益率")} REAL,
+                {quote_identifier("自己資本比率")} REAL,
+                {quote_identifier("現金比率")} REAL,
+                {quote_identifier("全数値JSON")} TEXT,
+                {quote_identifier("raw_json")} TEXT NOT NULL,
+                {quote_identifier("取得日時")} TEXT NOT NULL
+            )
+            """
         )
-        """
-    )
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_edinet_documents_doc_id ON edinet_documents (doc_id)"
-    )
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(edinet_documents)")}
-    if "sec_code" not in existing:
-        conn.execute("ALTER TABLE edinet_documents ADD COLUMN sec_code TEXT")
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(edinet_documents)")}
-    for column, col_type in EXTRA_COLUMNS:
-        if column not in existing:
-            conn.execute(f"ALTER TABLE edinet_documents ADD COLUMN {column} {col_type}")
+        conn.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {quote_identifier(f'idx_{table}_doc_id')} ON {quote_identifier(table)} ({quote_identifier('doc_id')})"
+        )
+
+    create_table(table_all)
+    create_table(table_select)
 
 
-def save_documents(conn: sqlite3.Connection, date_str: str, documents: list[dict]) -> int:
+
+def save_documents(conn: sqlite3.Connection, date_str: str, documents: list[dict]) -> tuple[int, int]:
     fetched_at = dt.datetime.now(dt.timezone.utc).isoformat()
     columns = [
-        "fetched_date",
+        "取得日",
         "doc_id",
-        "edinet_code",
-        "sec_code",
-        "filer_name",
-        "doc_description",
-        "submit_datetime",
-        "period_end",
-        "sales_amount",
-        "employee_count",
-        "operating_income",
-        "ordinary_income",
-        "net_income",
-        "total_assets",
-        "total_liabilities",
-        "total_equity",
-        "cash_and_equivalents",
-        "operating_cf",
-        "investing_cf",
-        "financing_cf",
-        "eps",
-        "bps",
-        "roe",
-        "roa",
-        "gross_margin",
-        "operating_margin",
-        "net_margin",
-        "equity_ratio",
-        "cash_ratio",
-        "all_numeric_facts_json",
+        "Edinet_code",
+        "Sec_code",
+        "提出者名",
+        "書類説明",
+        "提出日時",
+        "期間末日",
+        "売上高",
+        "従業員数",
+        "営業利益",
+        "経常利益",
+        "純利益",
+        "総資産",
+        "負債総額",
+        "純資産",
+        "現金及び現金同等物",
+        "営業CF",
+        "投資CF",
+        "財務CF",
+        "EPS",
+        "BPS",
+        "ROE",
+        "ROA",
+        "売上総利益率",
+        "営業利益率",
+        "純利益率",
+        "自己資本比率",
+        "現金比率",
+        "全数値JSON",
         "raw_json",
-        "fetched_at",
+        "取得日時",
     ]
+    quoted_cols = ", ".join(quote_identifier(c) for c in columns)
     placeholders = ", ".join(["?"] * len(columns))
     update_assignments = ", ".join(
-        [f"{col}=excluded.{col}" for col in columns if col != "doc_id"]
+        [f"{quote_identifier(col)}=excluded.{quote_identifier(col)}" for col in columns if col != "doc_id"]
     )
-    inserted = 0
-    rows = []
+    inserted_all = 0
+    inserted_select = 0
+    rows_all = []
+    rows_select = []
     for doc in documents:
         doc_id = doc.get("docID") or doc.get("docId")
+        sec_code = normalize_sec_code(doc.get("secCode") or doc.get("sec_code"))
         row = (
             date_str,
             doc_id,
             doc.get("edinetCode"),
-            normalize_sec_code(doc.get("secCode") or doc.get("sec_code")),
+            sec_code,
             doc.get("filerName"),
             doc.get("docDescription"),
             doc.get("submitDateTime"),
             doc.get("period_end"),
-            doc.get("sales_amount"),
+            round_numeric(doc.get("sales_amount")),
             doc.get("employee_count"),
-            doc.get("operating_income"),
-            doc.get("ordinary_income"),
-            doc.get("net_income"),
-            doc.get("total_assets"),
-            doc.get("total_liabilities"),
-            doc.get("total_equity"),
-            doc.get("cash_and_equivalents"),
-            doc.get("operating_cf"),
-            doc.get("investing_cf"),
-            doc.get("financing_cf"),
-            doc.get("eps"),
-            doc.get("bps"),
-            doc.get("roe"),
-            doc.get("roa"),
-            doc.get("gross_margin"),
-            doc.get("operating_margin"),
-            doc.get("net_margin"),
-            doc.get("equity_ratio"),
-            doc.get("cash_ratio"),
+            round_numeric(doc.get("operating_income")),
+            round_numeric(doc.get("ordinary_income")),
+            round_numeric(doc.get("net_income")),
+            round_numeric(doc.get("total_assets")),
+            round_numeric(doc.get("total_liabilities")),
+            round_numeric(doc.get("total_equity")),
+            round_numeric(doc.get("cash_and_equivalents")),
+            round_numeric(doc.get("operating_cf")),
+            round_numeric(doc.get("investing_cf")),
+            round_numeric(doc.get("financing_cf")),
+            round_numeric(doc.get("eps")),
+            round_numeric(doc.get("bps")),
+            round_numeric(doc.get("roe")),
+            round_numeric(doc.get("roa")),
+            round_numeric(doc.get("gross_margin")),
+            round_numeric(doc.get("operating_margin")),
+            round_numeric(doc.get("net_margin")),
+            round_numeric(doc.get("equity_ratio")),
+            round_numeric(doc.get("cash_ratio")),
             doc.get("all_numeric_facts_json"),
             json.dumps(doc, ensure_ascii=False),
             fetched_at,
         )
-        rows.append(row)
-    if rows:
+        rows_all.append(row)
+        if sec_code:
+            rows_select.append(row)
+    if rows_all:
         conn.executemany(
             f"""
-            INSERT INTO edinet_documents ({", ".join(columns)})
+            INSERT INTO {quote_identifier('table_docment_all')} ({quoted_cols})
             VALUES ({placeholders})
             ON CONFLICT(doc_id) DO NOTHING
             """,
-            rows,
+            rows_all,
         )
-        inserted = len(rows)
+        inserted_all = len(rows_all)
+    if rows_select:
+        conn.executemany(
+            f"""
+            INSERT INTO {quote_identifier('table_docment_serect')} ({quoted_cols})
+            VALUES ({placeholders})
+            ON CONFLICT(doc_id) DO NOTHING
+            """,
+            rows_select,
+        )
+        inserted_select = len(rows_select)
     conn.commit()
-    return inserted
+    return inserted_all, inserted_select
 
 
 def safe_div(numerator: float | None, denominator: float | None) -> float | None:
@@ -1037,6 +1125,12 @@ def enrich_document(api_key: str, doc: dict, include_all_metrics: bool) -> dict:
 
 
 def main() -> int:
+    run_start = jst_now()
+    status = "failed"
+    error_message = None
+    total_docs = 0
+    inserted = 0
+    inserted_select = 0
     script_dir = os.path.dirname(os.path.abspath(__file__))
     load_dotenv(os.path.join(script_dir, "..", ".env"))
     api_key = os.environ.get("EDINET_API_KEY")
@@ -1044,80 +1138,123 @@ def main() -> int:
         print("EDINET_API_KEY is not set. Please set it in .env or environment variables.", file=sys.stderr)
         return 1
 
-    start_date = parse_date_config(START_DATE, "START_DATE")
-    end_date = parse_date_config(END_DATE, "END_DATE")
-    if start_date is None:
-        start_date = dt.date.fromisoformat(jst_today_str())
-    if end_date is None:
-        end_date = dt.date.fromisoformat(jst_today_str())
-
-    if start_date > end_date:
-        print("start-date must be <= end-date.", file=sys.stderr)
-        return 1
-
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-
-    all_documents: list[dict] = []
-    for current_date in daterange(start_date, end_date):
-        date_str = current_date.isoformat()
-        try:
-            payload = fetch_documents(api_key, date_str, type_value=2)
-        except Exception as e:
-            print(f"Failed to fetch documents for {date_str}: {e}", file=sys.stderr)
-            return 1
-
-        documents = extract_documents(payload)
-        if not INCLUDE_ALL_DOCS:
-            keywords = [k.strip() for k in DEFAULT_KEYWORDS if k.strip()]
-            documents = [doc for doc in documents if looks_like_financial(doc, keywords)]
-        print(
-            f"[INFO] {date_str}: {len(documents)} documents "
-            f"(filtered={not INCLUDE_ALL_DOCS})"
-        )
-        for doc in documents:
-            doc["_fetched_date"] = date_str
-        all_documents.extend(documents)
-
-    edinet_codes = {
-        str(doc.get("edinetCode") or doc.get("edinet_code") or "").strip()
-        for doc in all_documents
-    }
-    ensure_master_company_entries(DB_PATH, EDINET_CODE_CSV, edinet_codes)
-    conn = sqlite3.connect(DB_PATH)
     try:
-        ensure_schema(conn)
-        inserted = 0
-        enriched_by_date: dict[str, list[dict]] = {}
+        start_date = parse_date_config(START_DATE, "START_DATE")
+        end_date = parse_date_config(END_DATE, "END_DATE")
+        if start_date is None:
+            start_date = dt.date.fromisoformat(jst_today_str())
+        if end_date is None:
+            end_date = dt.date.fromisoformat(jst_today_str())
+
+        if start_date > end_date:
+            raise ValueError("start-date must be <= end-date.")
+
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+        all_documents: list[dict] = []
+        for current_date in daterange(start_date, end_date):
+            date_str = current_date.isoformat()
+            try:
+                payload = fetch_documents(api_key, date_str, type_value=2)
+            except Exception as e:
+                raise RuntimeError(f"Failed to fetch documents for {date_str}: {e}") from e
+
+            documents = extract_documents(payload)
+            if not INCLUDE_ALL_DOCS:
+                keywords = [k.strip() for k in DEFAULT_KEYWORDS if k.strip()]
+                documents = [doc for doc in documents if looks_like_financial(doc, keywords)]
+            print(
+                f"[INFO] {date_str}: {len(documents)} documents "
+                f"(filtered={not INCLUDE_ALL_DOCS})"
+            )
+            for doc in documents:
+                doc["_fetched_date"] = date_str
+            all_documents.extend(documents)
+
         total_docs = len(all_documents)
-        print(f"[INFO] Total documents to process: {total_docs}")
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(enrich_document, api_key, doc, INCLUDE_ALL_METRICS): doc
-                for doc in all_documents
-            }
-            completed = 0
-            for future in as_completed(futures):
-                doc = futures[future]
-                try:
-                    enriched = future.result()
-                except Exception as e:
-                    doc_id = doc.get("docID") or doc.get("docId")
-                    print(f"Failed to parse XBRL for {doc_id}: {e}", file=sys.stderr)
-                    enriched = doc
-                enriched_by_date.setdefault(enriched["_fetched_date"], []).append(enriched)
-                completed += 1
-                if completed % 10 == 0 or completed == total_docs:
-                    print(f"[INFO] XBRL processed: {completed}/{total_docs}")
+        edinet_codes = {
+            str(doc.get("edinetCode") or doc.get("edinet_code") or "").strip()
+            for doc in all_documents
+        }
+        ensure_master_company_entries(DB_PATH, EDINET_CODE_CSV, edinet_codes)
+        updated = update_master_company_sec_codes(DB_PATH, all_documents)
+        if updated:
+            print(f"[INFO] master_company sec_code updated: {updated} rows.")
 
-        for date_str, docs in enriched_by_date.items():
-            count = save_documents(conn, date_str, docs)
-            inserted += count
-            print(f"[INFO] Saved {count} docs for {date_str}")
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            ensure_schema(conn)
+            enriched_by_date: dict[str, list[dict]] = {}
+            print(f"[INFO] Total documents to process: {total_docs}")
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(enrich_document, api_key, doc, INCLUDE_ALL_METRICS): doc
+                    for doc in all_documents
+                }
+                completed = 0
+                for future in as_completed(futures):
+                    doc = futures[future]
+                    try:
+                        enriched = future.result()
+                    except Exception as e:
+                        doc_id = doc.get("docID") or doc.get("docId")
+                        print(f"Failed to parse XBRL for {doc_id}: {e}", file=sys.stderr)
+                        enriched = doc
+                    enriched_by_date.setdefault(enriched["_fetched_date"], []).append(enriched)
+                    completed += 1
+                    if completed % 10 == 0 or completed == total_docs:
+                        print(f"[INFO] XBRL processed: {completed}/{total_docs}")
+
+            for date_str, docs in enriched_by_date.items():
+                count_all, count_select = save_documents(conn, date_str, docs)
+                inserted += count_all
+                inserted_select += count_select
+                print(
+                    f"[INFO] Saved {count_all} docs for {date_str} "
+                    f"(select={count_select})"
+                )
+        finally:
+            conn.close()
+
+        print(
+            f"Saved {inserted} documents to {DB_PATH} (date={START_DATE}..{END_DATE}). "
+            f"select={inserted_select}"
+        )
+        status = "success"
+        return 0
+    except Exception as e:
+        error_message = str(e)
+        print(f"[ERROR] {e}", file=sys.stderr)
     finally:
-        conn.close()
-
-    print(f"Saved {inserted} documents to {DB_PATH} (date={START_DATE}..{END_DATE}).")
-    return 0
+        run_end = jst_now()
+        duration = (run_end - run_start).total_seconds()
+        try:
+            os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                ensure_history_schema(conn)
+                conn.execute(
+                    """
+                    INSERT INTO table_HistoryRun
+                        (start_at, end_at, duration_sec, total_docs, inserted_docs, status, error_message)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        format_jst(run_start),
+                        format_jst(run_end),
+                        duration,
+                        total_docs,
+                        inserted,
+                        status,
+                        error_message,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"[WARN] Failed to write HistoryRun: {e}", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

@@ -92,7 +92,10 @@ MASTER_COMPANY_TABLE = "master_company"
 
 
 ##　未対応20260203
-- masterCompanyに証券コードが登録されてない
+- masterCompanyに企業名が登録されてない
 - HistoryRunテーブルを作成する。
 - SecCodeがNullの情報は正直不要。どうするか
+- 取得済み期間の記録（スキップ用）
+- 対象期間はyyyy-mmにする
+
 
